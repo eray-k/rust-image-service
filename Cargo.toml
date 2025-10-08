@@ -1,0 +1,15 @@
+[package]
+name = "image-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.6"
+axum_typed_multipart = "0.16.4"
+dotenvy = "0.15.7"
+serde = "1.0.228"
+serde_json = "1.0.145"
+sqlx = { version = "0.8.6", features = ["macros", "postgres", "runtime-tokio-rustls", "uuid"] }
+tempfile = "3.23.0"
+tokio = { version = "1.47.1", features = ["full"] }
+uuid = { version = "1.18.1", features = ["v4"] }

@@ -1,0 +1,42 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'image-server'",
+      "cargo": {
+        "args": [
+          "build",
+          "--bin=image-server",
+          "--package=image-server"
+        ],
+        "filter": {
+          "name": "image-server",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'image-server'",
+      "cargo": {
+        "args": [
+          "test",
+          "--no-run",
+          "--bin=image-server",
+          "--package=image-server"
+        ],
+        "filter": {
+          "name": "image-server",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

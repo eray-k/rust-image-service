@@ -1,6 +1,5 @@
-use std::io::Read;
+use std::{fs::File, io::Read};
 
-use tempfile::NamedTempFile;
 
 pub enum ImageType {
     Jpeg,
@@ -18,6 +17,14 @@ impl ImageType {
     //     }
     // }
 
+    pub fn to_mime(&self) -> &'static str {
+        match self {
+            ImageType::Jpeg => "image/jpeg",
+            ImageType::Png => "image/png",
+            ImageType::Webp => "image/webp",
+        }
+    }
+
     pub fn extension(&self) -> &'static str {
         match self {
             ImageType::Jpeg => "jpg",
@@ -28,14 +35,17 @@ impl ImageType {
 }
 
 pub trait FindFileTypeExt {
-    fn find_imagetype(&mut self) -> Result<ImageType, Box<dyn std::error::Error>>;
+    async fn find_imagetype(&mut self) -> Result<ImageType, Box<dyn std::error::Error>>;
 }
 
-impl FindFileTypeExt for NamedTempFile {
-    fn find_imagetype(&mut self) -> Result<ImageType, Box<dyn std::error::Error>> {
-        let mut buf: [u8; 12] = [0; 12];
-        self.read(&mut buf).unwrap();
-        println!("{:?}", buf);
+impl FindFileTypeExt for File {
+    async fn find_imagetype(&mut self) -> Result<ImageType, Box<dyn std::error::Error>> {
+        let mut self_clone = self.try_clone()?; // Needed for lifetime
+        let buf = tokio::task::spawn_blocking(move || -> Result<[u8;12], std::io::Error> {
+            let mut buf: [u8; 12] = [0; 12];
+            self_clone.read(&mut buf)?;
+            Ok(buf)
+        }).await??;
 
         match buf {
             [0x89, 0x50, 0x4e, 0x47, ..] => Ok(ImageType::Png),

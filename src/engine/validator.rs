@@ -1,21 +1,22 @@
+use std::error::Error;
+
 use tempfile::NamedTempFile;
 
 use crate::image_type::{FindFileTypeExt, ImageType};
 
-pub struct ValidatedFile {
-    pub filetype: ImageType,
-    pub file: NamedTempFile,
+pub trait ValidateExt {
+    type Error;
+
+    async fn validate(&mut self) -> Result<ImageType, Self::Error>;
 }
 
-impl TryFrom<NamedTempFile> for ValidatedFile {
-    type Error = Box<dyn std::error::Error>;
+impl ValidateExt for NamedTempFile {
+    type Error = Box<dyn Error>;
 
-    fn try_from(mut value: NamedTempFile) -> Result<Self, Self::Error> {
-        let filetype = value.find_imagetype()?;
+    async fn validate(&mut self) -> Result<ImageType, Self::Error> {
+        let filetype = self.as_file_mut().find_imagetype().await?; // TODO: handle error
 
-        Ok(ValidatedFile {
-            filetype,
-            file: value,
-        })
+        Ok(filetype)
     }
 }
+

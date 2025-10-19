@@ -1,5 +1,6 @@
 use std::{fs::File, io::Read};
 
+use anyhow::Result;
 
 pub enum ImageType {
     Jpeg,
@@ -35,11 +36,11 @@ impl ImageType {
 }
 
 pub trait FindFileTypeExt {
-    async fn find_imagetype(&mut self) -> Result<ImageType, Box<dyn std::error::Error>>;
+    async fn find_imagetype(&mut self) -> Result<ImageType>;
 }
 
 impl FindFileTypeExt for File {
-    async fn find_imagetype(&mut self) -> Result<ImageType, Box<dyn std::error::Error>> {
+    async fn find_imagetype(&mut self) -> Result<ImageType> {
         let mut self_clone = self.try_clone()?; // Needed for lifetime
         let buf = tokio::task::spawn_blocking(move || -> Result<[u8;12], std::io::Error> {
             let mut buf: [u8; 12] = [0; 12];
@@ -53,7 +54,7 @@ impl FindFileTypeExt for File {
 
             // Source: https://www.iana.org/assignments/media-types/image/webp
             [0x52, 0x49, 0x46, 0x46, .., 0x57, 0x45, 0x42, 0x50] => Ok(ImageType::Webp),
-            _ => Err("unsupported file type".into()),
+            _ => Err(anyhow::anyhow!("Unsupported file type")),
         }
     }
 }

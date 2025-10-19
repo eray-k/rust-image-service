@@ -6,8 +6,7 @@ Small Rust service that accepts single-file image uploads and records them in a 
 ## The goals
 
 - Use a hands-on project to sharpen my Rust skills by implementing a real file upload microservice.
-- Build a lightweight, configurable file-upload server that can be dropped into projects as an alternative to [hupload](https://github.com/ybizeul/hupload) and [DumbDrop](https://github.com/DumbWareio/DumbDrop), with the emphasis on configurability.
-
+- Build a lightweight, configurable file-upload server that can be migrated into projects easily.
 
 
 ## What it does

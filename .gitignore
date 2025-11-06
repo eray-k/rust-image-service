@@ -1,3 +1,7 @@
+/.idea
 /target
+
+/test_assets
 /uploads
+
 .env

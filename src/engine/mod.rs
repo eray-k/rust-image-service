@@ -2,15 +2,21 @@ use std::path::PathBuf;
 
 use axum::{extract::{Path, State}, http::{header, HeaderValue, StatusCode}, response::{IntoResponse, Response}};
 use axum_typed_multipart::{FieldData, TryFromMultipart, TypedMultipart};
+use image::ImageFormat;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use tokio_util::io::ReaderStream;
 use tempfile::NamedTempFile;
 use tokio::fs::File;
 use uuid::Uuid;
 
-use crate::{config::CONFIG, engine::validator::ValidateExt, error::handle_internal_error, AppState};
+use crate::{config::CONFIG, error::handle_internal_error, AppState};
+use crate::engine::image_engine::{process_image, validate_image, OutputConfig};
 
-mod validator;
+mod image_engine;
+
+const OUTPUT_CONFIG: OutputConfig = OutputConfig::new()
+    .aspect_ratio(1.0)
+    .format(ImageFormat::WebP);
 
 #[derive(TryFromMultipart)]
 pub struct UploadFileRequest {
@@ -23,38 +29,37 @@ pub async fn upload(
     state: State<AppState>,
     TypedMultipart(UploadFileRequest {
         user_id,
-        mut image,
+        image,
     }): TypedMultipart<UploadFileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // Validate the file
-    let validated_imagetype = image.contents.validate().await.map_err(|e| {
+    let _ = validate_image(&image.contents.path()).map_err(|e| {
         eprintln!("Validation error: {}", e);
         (StatusCode::BAD_REQUEST, "Invalid image file".to_string())
     })?;
 
     let new_uuid = uuid::Uuid::new_v4();
 
-    let filepath = format!(
-        "{}/{}.{}",
-        CONFIG.upload_dir,
-        &new_uuid,
-        validated_imagetype.extension()
-    );
+    let mut filepath = PathBuf::from(&CONFIG.upload_dir);
+    filepath.push(&new_uuid.to_string());
+    filepath.set_extension(OUTPUT_CONFIG.convert_format.unwrap().extensions_str()[0]);
 
+    // Insert into db
     sqlx::query!(
         "insert into image (id, user_id, filepath, mime) values ($1, $2, $3, $4)",
         new_uuid,
         user_id,
-        filepath,
-        validated_imagetype.to_mime()
+        filepath.to_str(),
+        OUTPUT_CONFIG.convert_format.unwrap().to_mime_type()
     )
     .execute(&state.db)
     .await.map_err(handle_internal_error)?;
 
+    // Process and persist image
     tokio::task::spawn_blocking(move || {
-        image.contents.persist(&filepath)
-    }).await.map_err(handle_internal_error)?
-    .map_err(handle_internal_error)?;
+        process_image(image.contents.path(), &filepath, &OUTPUT_CONFIG)
+    }).await
+        .map_err(handle_internal_error)?
+        .map_err(handle_internal_error)?;
 
     Ok((StatusCode::CREATED, new_uuid.to_string()))
 }

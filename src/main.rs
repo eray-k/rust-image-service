@@ -9,7 +9,6 @@ use crate::engine::{delete_image, download, upload};
 
 mod config;
 mod engine;
-mod image_type;
 mod error;
 
 #[derive(Clone)]
@@ -20,7 +19,7 @@ struct AppState {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Connect to the database
-    let db = sqlx::postgres::PgPool::connect(&CONFIG.db_url).await.expect("Couldn't connect to database");
+    let db = PgPool::connect(&CONFIG.db_url).await.expect("Couldn't connect to database");
 
     sqlx::migrate!("./migrations").run(&db).await.expect("Migrations failed");
     

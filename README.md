@@ -12,10 +12,11 @@ Small Rust service that accepts single-file image uploads and records them in a 
 ## What it does
 
 - Accepts multipart/form-data POST requests to `/` with fields:
-	- `user_id` (UUID)
+	- `user_id` (UUID) (Currently not in use)
 	- `image` (file, limited to ~2 MiB in the request struct)
-- Validates the uploaded file's Content-Type (jpeg/png/webp).
-- Persists the uploaded file to the `UPLOAD_DIR` and inserts a record in the `image` table (id, user_id, filepath).
+- Validates the uploaded image file, checks for Magic Bytes.
+- Processes the image file (resizing, cropping etc.)
+- Persists the processed image to the `UPLOAD_DIR` and inserts a record in the `image` table (id, user_id, filepath).
 
 ## Repo layout
 
@@ -48,7 +49,7 @@ cargo sqlx migrate run
 cargo run
 ```
 
-By default the server binds to `0.0.0.0:7070`.
+By default, the server binds to `0.0.0.0:7070`.
 
 ## Notes & TODOs
 
@@ -56,6 +57,6 @@ By default the server binds to `0.0.0.0:7070`.
 
 - The code currently calls `unwrap()` on file persist and should be made robust (return error responses and remove partial files on failure).
 
-- File validation uses Content-Type header only; for security, validate magic bytes and file size explicitly.
+- ~~File validation uses Content-Type header only; for security, validate magic bytes and file size explicitly.~~
 
 - The service will improved to handle/serve different type of files (`.pdf`, `.mp4`, `.csv`, etc.)

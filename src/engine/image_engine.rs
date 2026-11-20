@@ -1,13 +1,31 @@
 use anyhow::{anyhow, Result};
-use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, Limits};
 use std::path::Path;
 
+/// Largest accepted width/height, so a small upload can't declare huge dimensions (decompression bomb).
+pub const MAX_DIMENSION: u32 = 8192;
+/// Smallest accepted width/height.
+pub const MIN_DIMENSION: u32 = 16;
+
+
+/// The uploaded file could not be decoded, as opposed to a failure on our side.
+#[derive(Debug)]
+pub struct InvalidImage(pub image::ImageError);
+
+impl std::fmt::Display for InvalidImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Invalid image: {}", self.0)
+    }
+}
+
+impl std::error::Error for InvalidImage {}
 
 /// Currently the crops will be centered in all cases.
 pub struct OutputConfig {
     enforced_aspect_ratio: Option<f64>,
     resize_width: Option<u32>,
     pub convert_format: Option<ImageFormat>,
+    quality: f32,
 }
 
 impl OutputConfig {
@@ -16,6 +34,7 @@ impl OutputConfig {
             enforced_aspect_ratio: None,
             resize_width: None,
             convert_format: None,
+            quality: 70.,
         }
     }
     pub const fn aspect_ratio(mut self, val: f64) -> Self {
@@ -23,6 +42,7 @@ impl OutputConfig {
         self
     }
 
+    /// Downscales to `width`, keeping the aspect ratio. Smaller images are not upscaled.
     pub const fn rescale(mut self, width: u32) -> Self {
         self.resize_width = Some(width);
         self
@@ -33,52 +53,87 @@ impl OutputConfig {
         self
     }
 
-    pub fn target_width(&self) -> Option<u32> { self.resize_width }
-    pub fn target_height(&self) -> Option<u32> {
-        let res = (self.resize_width? as f64) * self.enforced_aspect_ratio?.round();
-        Some(res as u32)
+    /// Lossy WebP and JPEG quality, 0 to 100.
+    pub const fn quality(mut self, quality: f32) -> Self {
+        self.quality = quality;
+        self
     }
-    pub fn target_aspect_ratio(&self) -> Option<f64> { self.enforced_aspect_ratio }
 }
 
-/// Checks if the file is a valid image file
+/// What the header of a valid image declares.
+pub struct ImageInfo {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per pixel of the decoded buffer, e.g. 8 for 16-bit RGBA
+    pub bytes_per_pixel: u8,
+}
+
+/// Checks if the file is a valid image file, reading only its header
 ///
 /// # Returns
 /// Error on unsupported image format.
-/// Otherwise, educated guess of the image file.
+/// Otherwise, the image dimensions and decoded pixel size.
 ///
-pub fn validate_image<P: AsRef<Path>>(input: P) -> Result<ImageFormat> {
+pub fn validate_image<P: AsRef<Path>>(input: P) -> Result<ImageInfo> {
     let reader_with_format =
         ImageReader::open(input.as_ref())?.with_guessed_format()?;
 
-    let format = reader_with_format.format().ok_or(anyhow!("Unsupported image format"))?;
+    if reader_with_format.format().is_none() {
+        return Err(anyhow!("Unsupported image format"));
+    }
 
-    Ok(format)
+    let decoder = reader_with_format.into_decoder()?;
+    let (w, h) = decoder.dimensions();
+    if w > MAX_DIMENSION || h > MAX_DIMENSION {
+        return Err(anyhow!("Image dimensions {w}x{h} exceed {MAX_DIMENSION}"));
+    }
+    if w < MIN_DIMENSION || h < MIN_DIMENSION {
+        return Err(anyhow!("Image dimensions {w}x{h} are below {MIN_DIMENSION}"));
+    }
+
+    Ok(ImageInfo { width: w, height: h, bytes_per_pixel: decoder.color_type().bytes_per_pixel() })
 }
 
 
 /// Processes the given image
 ///
-/// Currently, resizes (not preserving the aspect ratio) and converts the image into `webp` format.
+/// Crops to the configured aspect ratio, downscales to the configured width, then converts to the configured format.
 pub fn process_image<P: AsRef<Path>>(input: P, output: P, output_config: &OutputConfig) -> Result<()> {
-    let mut img = ImageReader::open(input.as_ref())?
-        .with_guessed_format()?.decode()?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_DIMENSION);
+    limits.max_image_height = Some(MAX_DIMENSION);
+
+    let mut reader = ImageReader::open(input.as_ref())?.with_guessed_format()?;
+    reader.limits(limits);
+    let mut img = reader.decode().map_err(InvalidImage)?;
 
     if let Some(ratio) = output_config.enforced_aspect_ratio {
         img = crop_image(&mut img, ratio);
     }
 
-    // if let Some(width) = output_config.resize_width {
-    //     img = resize_image(&mut img, width);
-    // }
+    if let Some(width) = output_config.resize_width {
+        img = resize_image(img, width);
+    }
 
     match output_config.convert_format {
         Some(ImageFormat::WebP) => {
+            // libwebp only accepts 8-bit RGB/RGBA, so normalize grayscale and 16-bit inputs.
+            let img = match img.color().has_alpha() {
+                true => DynamicImage::ImageRgba8(img.to_rgba8()),
+                false => DynamicImage::ImageRgb8(img.to_rgb8()),
+            };
             let webp = match webp::Encoder::from_image(&img) {
-                Ok(enc) => enc.encode(70f32),
+                Ok(enc) => enc.encode(output_config.quality),
                 Err(e) => return Err(anyhow!("Error encoding image: {}", e)),
             };
-            std::fs::write(output, webp.as_ref())?;
+            std::fs::write(output, &*webp)?;
+        }
+        // JPEG has no alpha channel, and takes an integer quality from 1 to 100
+        Some(ImageFormat::Jpeg) => {
+            let quality = (output_config.quality.round() as u8).max(1);
+            let file = std::io::BufWriter::new(std::fs::File::create(output)?);
+            DynamicImage::ImageRgb8(img.to_rgb8())
+                .write_with_encoder(JpegEncoder::new_with_quality(file, quality))?;
         }
         Some(format) => img.save_with_format(output, format)?,
         None => img.save(output)?,
@@ -93,9 +148,10 @@ fn crop_image(img: &mut DynamicImage, aspect_ratio: f64) -> DynamicImage {
 
     let fit_width = image_aspect_ratio < aspect_ratio;
 
+    // At least 1px, so an extreme configured ratio can't crop the image away entirely
     let (new_w, new_h) = match fit_width {
-        true => (w, (w as f64 / aspect_ratio) as u32 ),
-        false => ((h as f64 ) as u32, h ),
+        true => (w, ((w as f64 / aspect_ratio) as u32).max(1)),
+        false => (((h as f64 * aspect_ratio) as u32).max(1), h),
     };
 
     let x = (w - new_w)/2;
@@ -104,8 +160,14 @@ fn crop_image(img: &mut DynamicImage, aspect_ratio: f64) -> DynamicImage {
     img.crop(x, y, new_w, new_h)
 }
 
-fn resize_image(img: &mut DynamicImage, resize_width: u32) -> DynamicImage {
-    todo!()
+fn resize_image(img: DynamicImage, resize_width: u32) -> DynamicImage {
+    let (w, h) = img.dimensions();
+    if w <= resize_width {
+        return img;
+    }
+
+    let new_h = ((h as f64 * resize_width as f64 / w as f64).round() as u32).max(1);
+    img.resize_exact(resize_width, new_h, FilterType::Lanczos3)
 }
 
 
@@ -143,27 +205,54 @@ mod tests {
         &header[0..4] == b"RIFF" && &header[8..12] == b"WEBP"
     }
 
-    // This test is no longer relevant
-    // #[test]
-    // fn converts_and_resizes_aspect_fit() {
-    //     let dir = tempdir().unwrap();
-    //     let in_path = dir.path().join("in.png");
-    //     let out_path = dir.path().join("out.webp");
-    //
-    //     // Original 2000x1000 (2:1)
-    //     let img = make_png(2000, 1000);
-    //     save_png(&img, &in_path);
-    //
-    //     // Box 800x800 ⇒ expect 800x400 (aspect-fit, no upscale)
-    //     process_image(&in_path, &out_path, ).unwrap();
-    //     assert!(out_path.exists(), "webp not created");
-    //     assert!(is_webp_file(&out_path), "not a WebP (bad header)");
-    //
-    //     // Decode and check dimensions
-    //     let decoded = image::open(&out_path).expect("decode webp");
-    //     let (w, h) = decoded.dimensions();
-    //     assert_eq!((w, h), (800, 400), "unexpected resized size");
-    // }
+    #[test]
+    fn converts_and_resizes_keeping_aspect() {
+        let dir = tempdir().unwrap();
+        let in_path = dir.path().join("in.png");
+        let out_path = dir.path().join("out.webp");
+        let config = OutputConfig::new()
+            .rescale(800)
+            .format(ImageFormat::WebP);
+
+        save_png(&make_png(2000, 1000), &in_path);
+
+        process_image(&in_path, &out_path, &config).unwrap();
+        assert!(is_webp_file(&out_path), "not a WebP (bad header)");
+        let decoded = image::open(&out_path).expect("decode webp");
+        assert_eq!(decoded.dimensions(), (800, 400), "unexpected resized size");
+    }
+
+    #[test]
+    fn no_upscale_when_smaller_than_width() {
+        let dir = tempdir().unwrap();
+        let in_path = dir.path().join("small.png");
+        let out_path = dir.path().join("small_out.png");
+        let config = OutputConfig::new()
+            .rescale(800);
+
+        save_png(&make_png(320, 240), &in_path);
+
+        process_image(&in_path, &out_path, &config).unwrap();
+        let decoded = image::open(&out_path).expect("decode png");
+        assert_eq!(decoded.dimensions(), (320, 240), "image was upscaled but shouldn't be");
+    }
+
+    #[test]
+    fn crops_then_resizes() {
+        let dir = tempdir().unwrap();
+        let in_path = dir.path().join("in.png");
+        let out_path = dir.path().join("out.png");
+        let config = OutputConfig::new()
+            .aspect_ratio(1.)
+            .rescale(100);
+
+        save_png(&make_png(1200, 1600), &in_path);
+
+        process_image(&in_path, &out_path, &config).unwrap();
+        let decoded = image::open(&out_path).expect("decode png");
+        assert_eq!(decoded.dimensions(), (100, 100));
+    }
+
     #[test]
     fn produces_webp_file() {
         let dir = tempdir().unwrap();
@@ -199,68 +288,116 @@ mod tests {
         assert_eq!((w, h), (240, 240), "image isn't the correct size");
     }
 
-    // #[test]
-    // fn no_upscale_when_smaller_than_box() {
-    //     let dir = tempdir().unwrap();
-    //     let in_path = dir.path().join("small.png");
-    //     let out_path = dir.path().join("small.webp");
-    //
-    //     // Original 320x240, box 800x800 ⇒ should remain 320x240
-    //     let img = make_png(320, 240);
-    //     save_png(&img, &in_path);
-    //
-    //     process_image(&in_path, &out_path).unwrap();
-    //     let decoded = image::open(&out_path).expect("decode webp");
-    //     let (w, h) = decoded.dimensions();
-    //     assert_eq!((w, h), (320, 240), "image was upscaled but shouldn't be");
-    // }
-    //
-    // #[test]
-    // fn wide_box_clamps_by_height() {
-    //     let dir = tempdir().unwrap();
-    //     let in_path = dir.path().join("in2.png");
-    //     let out_path = dir.path().join("out2.webp");
-    //
-    //     // Original 1200x1600 (portrait)
-    //     let img = make_png(1200, 1600);
-    //     save_png(&img, &in_path);
-    //
-    //     // Box 1000x600 ⇒ height is limiting ⇒ 450x600
-    //     process_image(&in_path, &out_path).unwrap();
-    //     let decoded = image::open(&out_path).expect("decode webp");
-    //     let (w, h) = decoded.dimensions();
-    //     assert_eq!((w, h), (450, 600));
-    // }
+    #[test]
+    fn applies_non_square_aspect_ratio() {
+        let dir = tempdir().unwrap();
+        let in_path = dir.path().join("wide.png");
+        let out_path = dir.path().join("wide_out.png");
+        let config = OutputConfig::new()
+            .aspect_ratio(2.);
 
-    // #[test]
-    // fn maintains_alpha_channel_after_encode() {
-    //     let dir = tempdir().unwrap();
-    //     let in_path = dir.path().join("alpha.png");
-    //     let out_path = dir.path().join("alpha.webp");
-    //
-    //     // 100x100 with a transparent stripe
-    //     let mut img = RgbaImage::new(100, 100);
-    //     for y in 0..100 {
-    //         for x in 0..100 {
-    //             let a = if x < 50 { 0 } else { 255 };
-    //             img.put_pixel(x, y, Rgba([10, 200, 100, a]));
-    //         }
-    //     }
-    //     save_png(&img, &in_path);
-    //
-    //     process_image(&in_path, &out_path).unwrap();
-    //     let decoded = image::open(&out_path).unwrap().to_rgba8();
-    //
-    //     // Check that some pixels remain transparent and some opaque
-    //     let mut saw_transparent = false;
-    //     let mut saw_opaque = false;
-    //     for y in 0..decoded.height() {
-    //         for x in 0..decoded.width() {
-    //             let a = decoded.get_pixel(x, y)[3];
-    //             if a < 20 { saw_transparent = true; }
-    //             if a > 230 { saw_opaque = true; }
-    //         }
-    //     }
-    //     assert!(saw_transparent && saw_opaque, "alpha lost during conversion");
-    // }
+        save_png(&make_png(1000, 200), &in_path);
+
+        process_image(&in_path, &out_path, &config).unwrap();
+        let decoded = image::open(&out_path).expect("decode png");
+        assert_eq!(decoded.dimensions(), (400, 200), "image isn't the correct size");
+    }
+
+    #[test]
+    fn encodes_grayscale_as_webp() {
+        let dir = tempdir().unwrap();
+        let in_path = dir.path().join("gray.png");
+        let out_path = dir.path().join("gray.webp");
+        let config = OutputConfig::new()
+            .format(ImageFormat::WebP);
+
+        image::GrayImage::new(64, 64).save(&in_path).unwrap();
+
+        process_image(&in_path, &out_path, &config).unwrap();
+        assert!(is_webp_file(&out_path), "not a WebP (bad header)");
+    }
+
+    #[test]
+    fn maintains_alpha_channel_after_encode() {
+        let dir = tempdir().unwrap();
+        let in_path = dir.path().join("alpha.png");
+        let out_path = dir.path().join("alpha.webp");
+        let config = OutputConfig::new()
+            .format(ImageFormat::WebP);
+
+        // 100x100 with a transparent stripe
+        let img = RgbaImage::from_fn(100, 100, |x, _| {
+            Rgba([10, 200, 100, if x < 50 { 0 } else { 255 }])
+        });
+        save_png(&img, &in_path);
+
+        process_image(&in_path, &out_path, &config).unwrap();
+        let decoded = image::open(&out_path).unwrap().to_rgba8();
+
+        let saw_transparent = decoded.pixels().any(|p| p[3] < 20);
+        let saw_opaque = decoded.pixels().any(|p| p[3] > 230);
+        assert!(saw_transparent && saw_opaque, "alpha lost during conversion");
+    }
+
+    #[test]
+    fn rejects_disabled_format() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("in.gif");
+        // Valid GIF magic bytes, but the GIF decoder is not compiled in
+        std::fs::write(&path, b"GIF89a\x01\x00\x01\x00\x00\x00\x00;").unwrap();
+
+        assert!(validate_image(&path).is_err());
+    }
+
+    #[test]
+    fn reports_decoded_pixel_size() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deep.png");
+        image::ImageBuffer::<Rgba<u16>, _>::new(32, 16).save(&path).unwrap();
+
+        let info = validate_image(&path).unwrap();
+        assert_eq!((info.width, info.height, info.bytes_per_pixel), (32, 16, 8));
+    }
+
+    #[test]
+    fn extreme_aspect_ratio_keeps_one_pixel() {
+        let dir = tempdir().unwrap();
+        let in_path = dir.path().join("tiny.png");
+        let out_path = dir.path().join("tiny.webp");
+        let config = OutputConfig::new()
+            .aspect_ratio(32.)
+            .format(ImageFormat::WebP);
+
+        save_png(&make_png(16, 16), &in_path);
+
+        process_image(&in_path, &out_path, &config).unwrap();
+        let decoded = image::open(&out_path).expect("decode webp");
+        assert_eq!(decoded.dimensions(), (16, 1));
+    }
+
+    #[test]
+    fn rejects_too_small_image() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("small.png");
+        save_png(&make_png(16, 15), &path);
+        assert!(validate_image(&path).is_err());
+
+        save_png(&make_png(16, 16), &path);
+        assert!(validate_image(&path).is_ok());
+    }
+
+    #[test]
+    fn applies_jpeg_quality() {
+        let dir = tempdir().unwrap();
+        let in_path = dir.path().join("in.png");
+        save_png(&make_png(256, 256), &in_path);
+
+        let size = |quality: f32| {
+            let out_path = dir.path().join(format!("out_{quality}.jpg"));
+            let config = OutputConfig::new().format(ImageFormat::Jpeg).quality(quality);
+            process_image(&in_path, &out_path, &config).unwrap();
+            fs::metadata(&out_path).unwrap().len()
+        };
+        assert!(size(10.) < size(95.), "quality had no effect");
+    }
 }

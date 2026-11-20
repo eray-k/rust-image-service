@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select user_id, filepath, mime from image where id=$1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "filepath",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "mime",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "966068a6c9661c2a588fe7bcca7b6beb676a313d46caf730cce5da3b75bbc2e8"
+}

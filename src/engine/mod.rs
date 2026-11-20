@@ -2,64 +2,110 @@ use std::path::PathBuf;
 
 use axum::{extract::{Path, State}, http::{header, HeaderValue, StatusCode}, response::{IntoResponse, Response}};
 use axum_typed_multipart::{FieldData, TryFromMultipart, TypedMultipart};
-use image::ImageFormat;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use tokio_util::io::ReaderStream;
 use tempfile::NamedTempFile;
 use tokio::fs::File;
+use tokio::sync::OwnedSemaphorePermit;
+use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::{config::CONFIG, error::handle_internal_error, AppState};
-use crate::engine::image_engine::{process_image, validate_image, OutputConfig};
+use crate::{auth::AuthUser, config::CONFIG, error::handle_internal_error, AppState};
+use crate::engine::image_engine::{process_image, validate_image, InvalidImage};
+use crate::runtime::{Runtime, RuntimeConfig};
+
+pub use image_engine::OutputConfig;
 
 mod image_engine;
 
-const OUTPUT_CONFIG: OutputConfig = OutputConfig::new()
-    .aspect_ratio(1.0)
-    .format(ImageFormat::WebP);
+/// Estimated peak memory of processing a `w`x`h` image in MiB: the decoded RGBA
+/// buffer plus the cropped and color-converted copies made before encoding.
+fn processing_cost_mb(w: u32, h: u32, budget_mb: usize) -> u32 {
+    let bytes = w as u64 * h as u64 * 4 * 3;
+    // An image costing more than the whole budget still runs, alone.
+    (bytes.div_ceil(1024 * 1024) as u32).clamp(1, budget_mb as u32)
+}
+
+/// Waits for memory budget and a worker slot to process a `w`x`h` image.
+async fn acquire_processing(
+    runtime: &Runtime,
+    config: &RuntimeConfig,
+    w: u32,
+    h: u32,
+) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), (StatusCode, String)> {
+    let acquire = async {
+        let cost = processing_cost_mb(w, h, runtime.memory_budget.size());
+        let memory = runtime.memory_budget.acquire(cost).await?;
+        let worker = runtime.workers.acquire(1).await?;
+        Ok::<_, tokio::sync::AcquireError>((memory, worker))
+    };
+
+    match tokio::time::timeout(config.queue_timeout(), acquire).await {
+        Ok(permits) => permits.map_err(handle_internal_error),
+        Err(_) => Err((StatusCode::SERVICE_UNAVAILABLE, "Server is busy, try again later".to_string())),
+    }
+}
 
 #[derive(TryFromMultipart)]
 pub struct UploadFileRequest {
-    user_id: Uuid,
     #[form_data(limit = "2MiB")]
     image: FieldData<NamedTempFile>,
 }
 
 pub async fn upload(
     state: State<AppState>,
+    AuthUser(user_id): AuthUser,
     TypedMultipart(UploadFileRequest {
-        user_id,
         image,
     }): TypedMultipart<UploadFileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let _ = validate_image(&image.contents.path()).map_err(|e| {
-        eprintln!("Validation error: {}", e);
+    let (width, height) = validate_image(&image.contents.path()).map_err(|e| {
+        warn!("Validation error: {}", e);
         (StatusCode::BAD_REQUEST, "Invalid image file".to_string())
     })?;
+
+    // One snapshot for the whole request, so a reload midway can't mix settings
+    let config = state.runtime.config();
+    let format = config.image_format();
+    let output_config = config.output_config();
 
     let new_uuid = uuid::Uuid::new_v4();
 
     let mut filepath = PathBuf::from(&CONFIG.upload_dir);
     filepath.push(&new_uuid.to_string());
-    filepath.set_extension(OUTPUT_CONFIG.convert_format.unwrap().extensions_str()[0]);
+    filepath.set_extension(format.extensions_str()[0]);
+
+    // Process and persist image before recording it, so a failure leaves no dangling row
+    let output_path = filepath.clone();
+    let permits = acquire_processing(&state.runtime, &config, width, height).await?;
+    tokio::task::spawn_blocking(move || {
+        // Held by the task itself, so capacity stays reserved even if the client disconnects
+        let _permits = permits;
+        process_image(image.contents.path(), &output_path, &output_config)
+    }).await
+        .map_err(handle_internal_error)?
+        .map_err(|e| match e.downcast_ref::<InvalidImage>() {
+            // Header looked fine but the content isn't a decodable image
+            Some(_) => {
+                warn!("Validation error: {}", e);
+                (StatusCode::BAD_REQUEST, "Invalid image file".to_string())
+            }
+            None => handle_internal_error(e),
+        })?;
 
     // Insert into db
-    sqlx::query!(
+    if let Err(e) = sqlx::query!(
         "insert into image (id, user_id, filepath, mime) values ($1, $2, $3, $4)",
         new_uuid,
         user_id,
         filepath.to_str(),
-        OUTPUT_CONFIG.convert_format.unwrap().to_mime_type()
+        format.to_mime_type()
     )
     .execute(&state.db)
-    .await.map_err(handle_internal_error)?;
-
-    // Process and persist image
-    tokio::task::spawn_blocking(move || {
-        process_image(image.contents.path(), &filepath, &OUTPUT_CONFIG)
-    }).await
-        .map_err(handle_internal_error)?
-        .map_err(handle_internal_error)?;
+    .await {
+        let _ = tokio::fs::remove_file(&filepath).await;
+        return Err(handle_internal_error(e));
+    }
 
     Ok((StatusCode::CREATED, new_uuid.to_string()))
 }
@@ -77,7 +123,7 @@ pub async fn download(
         };
 
     if db_model.filepath.is_none() || db_model.mime.is_none() {
-        eprintln!("Database model is missing fields: {:?}", db_model);
+        error!("Database model is missing fields: {:?}", db_model);
         return not_found_err;
     }
 
@@ -85,7 +131,7 @@ pub async fn download(
 
     // Ensure file exists
     if !path.is_file() {
-        eprintln!("File does not exist at path: {:?}", path);
+        error!("File does not exist at path: {:?}", path);
         return not_found_err;
     }
 
@@ -113,21 +159,31 @@ pub async fn download(
 pub async fn delete_image(
     Path(image_id): Path<Uuid>,
     state: State<AppState>,
+    AuthUser(user_id): AuthUser,
 ) -> Result<(), (StatusCode, String)> {
     let db_record = sqlx::query!("select * from image where id=$1", image_id)
         .fetch_optional(&state.db)
         .await.map_err(handle_internal_error)?;
 
-    // TODO: User authorization check
-
-    if db_record.is_none() {
+    let Some(db_record) = db_record else {
         return Err((StatusCode::NOT_FOUND, "Image not found".to_string()));
+    };
+
+    if db_record.user_id != user_id {
+        return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
     }
 
     if let Err(e) = sqlx::query!("delete from image where id=$1", image_id)
         .execute(&state.db)
         .await {
         return Err(handle_internal_error(e));
+    }
+
+    // Row is already gone; a failure here only leaks the file
+    if let Some(filepath) = db_record.filepath {
+        if let Err(e) = tokio::fs::remove_file(&filepath).await {
+            error!("Failed to delete file {}: {}", filepath, e);
+        }
     }
 
     Ok(())

@@ -1,0 +1,24 @@
+# Settings that can be changed while the server runs. Every key is optional; the values
+# below are the defaults. Reloaded on SIGHUP or when the file changes.
+
+[processing]
+# Memory budget for concurrent image processing, in MiB
+memory_mb = 1024
+# Concurrent processing jobs, defaults to the CPU count
+# max_workers = 4
+# Seconds an upload may wait for processing capacity before getting a 503
+queue_timeout_secs = 10
+
+[output]
+# Width / height to center-crop to; remove to keep the original ratio
+aspect_ratio = 1.0
+# Width to downscale to (never upscales); remove to keep the original size
+width = 1024
+# webp, png or jpeg
+format = "webp"
+# Lossy WebP quality, 0 to 100
+quality = 70.0
+
+[log]
+# RUST_LOG-style filter, e.g. "debug" or "info,image_server=debug"; defaults to RUST_LOG or "info"
+# level = "info"

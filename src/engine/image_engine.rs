@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat, ImageReader, Limits};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, Limits};
 use std::path::Path;
 
 /// Largest accepted width/height, so a small upload can't declare huge dimensions (decompression bomb).
@@ -58,13 +58,21 @@ impl OutputConfig {
     }
 }
 
+/// What the header of a valid image declares.
+pub struct ImageInfo {
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per pixel of the decoded buffer, e.g. 8 for 16-bit RGBA
+    pub bytes_per_pixel: u8,
+}
+
 /// Checks if the file is a valid image file, reading only its header
 ///
 /// # Returns
 /// Error on unsupported image format.
-/// Otherwise, the image dimensions as `(width, height)`.
+/// Otherwise, the image dimensions and decoded pixel size.
 ///
-pub fn validate_image<P: AsRef<Path>>(input: P) -> Result<(u32, u32)> {
+pub fn validate_image<P: AsRef<Path>>(input: P) -> Result<ImageInfo> {
     let reader_with_format =
         ImageReader::open(input.as_ref())?.with_guessed_format()?;
 
@@ -72,12 +80,13 @@ pub fn validate_image<P: AsRef<Path>>(input: P) -> Result<(u32, u32)> {
         return Err(anyhow!("Unsupported image format"));
     }
 
-    let (w, h) = reader_with_format.into_dimensions()?;
+    let decoder = reader_with_format.into_decoder()?;
+    let (w, h) = decoder.dimensions();
     if w > MAX_DIMENSION || h > MAX_DIMENSION {
         return Err(anyhow!("Image dimensions {w}x{h} exceed {MAX_DIMENSION}"));
     }
 
-    Ok((w, h))
+    Ok(ImageInfo { width: w, height: h, bytes_per_pixel: decoder.color_type().bytes_per_pixel() })
 }
 
 
@@ -129,9 +138,10 @@ fn crop_image(img: &mut DynamicImage, aspect_ratio: f64) -> DynamicImage {
 
     let fit_width = image_aspect_ratio < aspect_ratio;
 
+    // At least 1px, so an extreme ratio on a tiny image can't crop it away entirely
     let (new_w, new_h) = match fit_width {
-        true => (w, (w as f64 / aspect_ratio) as u32 ),
-        false => ((h as f64 * aspect_ratio) as u32, h ),
+        true => (w, ((w as f64 / aspect_ratio) as u32).max(1)),
+        false => (((h as f64 * aspect_ratio) as u32).max(1), h),
     };
 
     let x = (w - new_w)/2;
@@ -327,5 +337,31 @@ mod tests {
         std::fs::write(&path, b"GIF89a\x01\x00\x01\x00\x00\x00\x00;").unwrap();
 
         assert!(validate_image(&path).is_err());
+    }
+
+    #[test]
+    fn reports_decoded_pixel_size() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deep.png");
+        image::ImageBuffer::<Rgba<u16>, _>::new(4, 2).save(&path).unwrap();
+
+        let info = validate_image(&path).unwrap();
+        assert_eq!((info.width, info.height, info.bytes_per_pixel), (4, 2, 8));
+    }
+
+    #[test]
+    fn extreme_aspect_ratio_keeps_one_pixel() {
+        let dir = tempdir().unwrap();
+        let in_path = dir.path().join("tiny.png");
+        let out_path = dir.path().join("tiny.webp");
+        let config = OutputConfig::new()
+            .aspect_ratio(2.)
+            .format(ImageFormat::WebP);
+
+        save_png(&RgbaImage::new(1, 1), &in_path);
+
+        process_image(&in_path, &out_path, &config).unwrap();
+        let decoded = image::open(&out_path).expect("decode webp");
+        assert_eq!(decoded.dimensions(), (1, 1));
     }
 }

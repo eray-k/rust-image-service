@@ -11,30 +11,29 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::{auth::AuthUser, config::CONFIG, error::handle_internal_error, AppState};
-use crate::engine::image_engine::{process_image, validate_image, InvalidImage};
+use crate::engine::image_engine::{process_image, validate_image, ImageInfo, InvalidImage};
 use crate::runtime::{Runtime, RuntimeConfig};
 
 pub use image_engine::OutputConfig;
 
 mod image_engine;
 
-/// Estimated peak memory of processing a `w`x`h` image in MiB: the decoded RGBA
-/// buffer plus the cropped and color-converted copies made before encoding.
-fn processing_cost_mb(w: u32, h: u32, budget_mb: usize) -> u32 {
-    let bytes = w as u64 * h as u64 * 4 * 3;
+/// Estimated peak memory of processing an image in MiB: the decoded buffer and its
+/// cropped copy at the input's pixel size, plus the 8-bit copy made before encoding.
+fn processing_cost_mb(info: &ImageInfo, budget_mb: usize) -> u32 {
+    let bytes = info.width as u64 * info.height as u64 * (2 * info.bytes_per_pixel as u64 + 4);
     // An image costing more than the whole budget still runs, alone.
     (bytes.div_ceil(1024 * 1024) as u32).clamp(1, budget_mb as u32)
 }
 
-/// Waits for memory budget and a worker slot to process a `w`x`h` image.
+/// Waits for memory budget and a worker slot to process the image.
 async fn acquire_processing(
     runtime: &Runtime,
     config: &RuntimeConfig,
-    w: u32,
-    h: u32,
+    info: &ImageInfo,
 ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), (StatusCode, String)> {
     let acquire = async {
-        let cost = processing_cost_mb(w, h, runtime.memory_budget.size());
+        let cost = processing_cost_mb(info, runtime.memory_budget.size());
         let memory = runtime.memory_budget.acquire(cost).await?;
         let worker = runtime.workers.acquire(1).await?;
         Ok::<_, tokio::sync::AcquireError>((memory, worker))
@@ -59,7 +58,7 @@ pub async fn upload(
         image,
     }): TypedMultipart<UploadFileRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (width, height) = validate_image(&image.contents.path()).map_err(|e| {
+    let info = validate_image(image.contents.path()).map_err(|e| {
         warn!("Validation error: {}", e);
         (StatusCode::BAD_REQUEST, "Invalid image file".to_string())
     })?;
@@ -72,12 +71,12 @@ pub async fn upload(
     let new_uuid = uuid::Uuid::new_v4();
 
     let mut filepath = PathBuf::from(&CONFIG.upload_dir);
-    filepath.push(&new_uuid.to_string());
+    filepath.push(new_uuid.to_string());
     filepath.set_extension(format.extensions_str()[0]);
 
     // Process and persist image before recording it, so a failure leaves no dangling row
     let output_path = filepath.clone();
-    let permits = acquire_processing(&state.runtime, &config, width, height).await?;
+    let permits = acquire_processing(&state.runtime, &config, &info).await?;
     tokio::task::spawn_blocking(move || {
         // Held by the task itself, so capacity stays reserved even if the client disconnects
         let _permits = permits;
@@ -180,10 +179,9 @@ pub async fn delete_image(
     }
 
     // Row is already gone; a failure here only leaks the file
-    if let Some(filepath) = db_record.filepath {
-        if let Err(e) = tokio::fs::remove_file(&filepath).await {
-            error!("Failed to delete file {}: {}", filepath, e);
-        }
+    if let Some(filepath) = db_record.filepath
+        && let Err(e) = tokio::fs::remove_file(&filepath).await {
+        error!("Failed to delete file {}: {}", filepath, e);
     }
 
     Ok(())

@@ -19,7 +19,7 @@ use crate::engine::OutputConfig;
 /// How often the config file is checked for changes.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub processing: ProcessingSettings,
@@ -80,16 +80,6 @@ impl Default for OutputSettings {
 impl Default for LogSettings {
     fn default() -> Self {
         Self { level: std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()) }
-    }
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            processing: ProcessingSettings::default(),
-            output: OutputSettings::default(),
-            log: LogSettings::default(),
-        }
     }
 }
 

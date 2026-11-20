@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+/// HS256 keys must be at least as long as the hash output (RFC 7518, section 3.2).
+const MIN_JWT_SECRET_LEN: usize = 32;
+
 pub struct Config {
     pub db_url: String,
     pub upload_dir: String,
@@ -32,6 +35,11 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is not set!");
     let upload_dir = std::env::var("UPLOAD_DIR").unwrap_or_else(|_| "./uploads".to_string());
     let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET is not set!");
+    // An empty or short secret would let anyone forge tokens
+    assert!(
+        jwt_secret.len() >= MIN_JWT_SECRET_LEN,
+        "JWT_SECRET must be at least {MIN_JWT_SECRET_LEN} bytes"
+    );
     let config_file = std::env::var_os("CONFIG_FILE").map(PathBuf::from);
 
     let bind_addr = bind_addr_arg();

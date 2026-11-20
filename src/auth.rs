@@ -29,7 +29,10 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthUser {
         let token = parts.headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
+            // The auth scheme is case-insensitive (RFC 7235)
+            .and_then(|v| v.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, token)| token.trim())
             .ok_or_else(unauthorized)?;
 
         // Validation::new requires and checks `exp` by default

@@ -10,7 +10,7 @@ memory_mb = 1024
 queue_timeout_secs = 10
 
 [output]
-# Width / height to center-crop to; remove to keep the original ratio
+# Width / height to center-crop to, 1/16 to 16; remove to keep the original ratio
 aspect_ratio = 1.0
 # Width to downscale to (never upscales); remove to keep the original size
 width = 1024

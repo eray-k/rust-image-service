@@ -97,8 +97,9 @@ impl RuntimeConfig {
         if self.processing.max_workers == Some(0) {
             bail!("processing.max_workers must be positive");
         }
-        if self.output.aspect_ratio.is_some_and(|r| !(r.is_finite() && r > 0.)) {
-            bail!("output.aspect_ratio must be a positive number");
+        // Also rejects NaN; outside this range crops would leave only a sliver of the image
+        if self.output.aspect_ratio.is_some_and(|r| !(1. / 16. ..=16.).contains(&r)) {
+            bail!("output.aspect_ratio must be between 1/16 and 16");
         }
         if self.output.width == Some(0) {
             bail!("output.width must be positive");
@@ -303,11 +304,20 @@ mod tests {
     }
 
     #[test]
+    fn accepts_aspect_ratio_bounds() {
+        for ratio in ["0.0625", "16.0"] {
+            assert!(RuntimeConfig::parse(&format!("[output]\naspect_ratio = {ratio}")).is_ok(), "rejected: {ratio}");
+        }
+    }
+
+    #[test]
     fn rejects_invalid_values() {
         for contents in [
             "[processing]\nmemory_mb = 0",
             "[processing]\nmax_workers = 0",
             "[output]\naspect_ratio = -1.0",
+            "[output]\naspect_ratio = 16.5",
+            "[output]\naspect_ratio = 0.06",
             "[output]\nquality = 150.0",
             "[output]\nformat = \"gif\"",
             "[log]\nlevel = \"no=such=filter\"",

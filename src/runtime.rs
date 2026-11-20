@@ -46,7 +46,7 @@ pub struct OutputSettings {
     /// Width to downscale to, none to keep the original size
     pub width: Option<u32>,
     pub format: OutputFormat,
-    /// Lossy WebP quality, 0 to 100
+    /// Lossy WebP and JPEG quality, 0 to 100
     pub quality: f32,
 }
 
@@ -135,7 +135,7 @@ impl RuntimeConfig {
     pub fn output_config(&self) -> OutputConfig {
         let mut config = OutputConfig::new()
             .format(self.image_format())
-            .webp_quality(self.output.quality);
+            .quality(self.output.quality);
         if let Some(ratio) = self.output.aspect_ratio {
             config = config.aspect_ratio(ratio);
         }

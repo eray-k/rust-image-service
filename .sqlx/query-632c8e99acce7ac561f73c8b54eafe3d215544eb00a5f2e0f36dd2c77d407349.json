@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from image where id=$1 and user_id=$2 returning filepath",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "filepath",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "632c8e99acce7ac561f73c8b54eafe3d215544eb00a5f2e0f36dd2c77d407349"
+}

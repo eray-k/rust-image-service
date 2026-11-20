@@ -32,10 +32,11 @@ async fn acquire_processing(
     config: &RuntimeConfig,
     info: &ImageInfo,
 ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), (StatusCode, String)> {
+    // Worker first, so memory is only reserved by jobs that are ready to run
     let acquire = async {
+        let worker = runtime.workers.acquire(1).await?;
         let cost = processing_cost_mb(info, runtime.memory_budget.size());
         let memory = runtime.memory_budget.acquire(cost).await?;
-        let worker = runtime.workers.acquire(1).await?;
         Ok::<_, tokio::sync::AcquireError>((memory, worker))
     };
 
@@ -160,26 +161,19 @@ pub async fn delete_image(
     state: State<AppState>,
     AuthUser(user_id): AuthUser,
 ) -> Result<(), (StatusCode, String)> {
-    let db_record = sqlx::query!("select * from image where id=$1", image_id)
-        .fetch_optional(&state.db)
-        .await.map_err(handle_internal_error)?;
-
-    let Some(db_record) = db_record else {
-        return Err((StatusCode::NOT_FOUND, "Image not found".to_string()));
-    };
-
-    if db_record.user_id != user_id {
-        return Err((StatusCode::FORBIDDEN, "Forbidden".to_string()));
-    }
-
-    if let Err(e) = sqlx::query!("delete from image where id=$1", image_id)
-        .execute(&state.db)
-        .await {
-        return Err(handle_internal_error(e));
-    }
+    // Someone else's image is reported as not found, so ids of other users' images aren't revealed
+    let filepath = sqlx::query_scalar!(
+        "delete from image where id=$1 and user_id=$2 returning filepath",
+        image_id,
+        user_id
+    )
+    .fetch_optional(&state.db)
+    .await
+    .map_err(handle_internal_error)?
+    .ok_or_else(|| (StatusCode::NOT_FOUND, "Image not found".to_string()))?;
 
     // Row is already gone; a failure here only leaks the file
-    if let Some(filepath) = db_record.filepath
+    if let Some(filepath) = filepath
         && let Err(e) = tokio::fs::remove_file(&filepath).await {
         error!("Failed to delete file {}: {}", filepath, e);
     }

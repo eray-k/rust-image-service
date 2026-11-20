@@ -16,7 +16,7 @@ aspect_ratio = 1.0
 width = 1024
 # webp, png or jpeg
 format = "webp"
-# Lossy WebP quality, 0 to 100
+# Lossy quality for WebP and JPEG, 0 to 100 (rounded for JPEG); PNG is lossless
 quality = 70.0
 
 [log]

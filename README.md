@@ -13,10 +13,11 @@ Small Rust service that accepts single-file image uploads and records them in a 
 
 - Accepts multipart/form-data POST requests to `/` with field:
 	- `image` (file, limited to ~2 MiB in the request struct)
-- Upload and delete require `Authorization: Bearer <JWT>`, an HS256 token signed with `JWT_SECRET` (at least 32 bytes) whose `sub` claim is the user's UUID and which has an `exp` claim. Only the uploader can delete an image. Download is public.
+- Upload and delete require `Authorization: Bearer <JWT>`, an HS256 token signed with `JWT_SECRET` (at least 32 bytes, used by this service only, since `aud`/`iss` aren't checked) whose `sub` claim is the user's UUID and which has an `exp` claim. Only the uploader can delete an image; deleting someone else's image returns `404`, same as a missing one. Download is public.
 - Limits concurrent processing by a memory budget (each image costs roughly `width * height * (2 * bytes_per_pixel + 4)` bytes, so 12 for 8-bit RGBA and 20 for 16-bit RGBA) and a worker count. Requests that can't get capacity within the queue timeout get `503`.
 - Validates the uploaded image file, checks for Magic Bytes.
 - Processes the image file: by default center-crops to 1:1, downscales to 1024 px wide (never upscales) and converts to WebP.
+- Images must be between 16x16 and 8192x8192 pixels.
 - Only PNG, JPEG and WebP inputs are accepted; other decoders are not compiled in.
 - Persists the processed image to the `UPLOAD_DIR` and inserts a record in the `image` table (id, user_id, filepath).
 

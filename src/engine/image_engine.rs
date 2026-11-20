@@ -1,9 +1,11 @@
 use anyhow::{anyhow, Result};
-use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, Limits};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, GenericImageView, ImageDecoder, ImageFormat, ImageReader, Limits};
 use std::path::Path;
 
 /// Largest accepted width/height, so a small upload can't declare huge dimensions (decompression bomb).
 pub const MAX_DIMENSION: u32 = 8192;
+/// Smallest accepted width/height.
+pub const MIN_DIMENSION: u32 = 16;
 
 
 /// The uploaded file could not be decoded, as opposed to a failure on our side.
@@ -23,7 +25,7 @@ pub struct OutputConfig {
     enforced_aspect_ratio: Option<f64>,
     resize_width: Option<u32>,
     pub convert_format: Option<ImageFormat>,
-    webp_quality: f32,
+    quality: f32,
 }
 
 impl OutputConfig {
@@ -32,7 +34,7 @@ impl OutputConfig {
             enforced_aspect_ratio: None,
             resize_width: None,
             convert_format: None,
-            webp_quality: 70.,
+            quality: 70.,
         }
     }
     pub const fn aspect_ratio(mut self, val: f64) -> Self {
@@ -51,9 +53,9 @@ impl OutputConfig {
         self
     }
 
-    /// Lossy WebP quality, 0 to 100.
-    pub const fn webp_quality(mut self, quality: f32) -> Self {
-        self.webp_quality = quality;
+    /// Lossy WebP and JPEG quality, 0 to 100.
+    pub const fn quality(mut self, quality: f32) -> Self {
+        self.quality = quality;
         self
     }
 }
@@ -84,6 +86,9 @@ pub fn validate_image<P: AsRef<Path>>(input: P) -> Result<ImageInfo> {
     let (w, h) = decoder.dimensions();
     if w > MAX_DIMENSION || h > MAX_DIMENSION {
         return Err(anyhow!("Image dimensions {w}x{h} exceed {MAX_DIMENSION}"));
+    }
+    if w < MIN_DIMENSION || h < MIN_DIMENSION {
+        return Err(anyhow!("Image dimensions {w}x{h} are below {MIN_DIMENSION}"));
     }
 
     Ok(ImageInfo { width: w, height: h, bytes_per_pixel: decoder.color_type().bytes_per_pixel() })
@@ -118,13 +123,18 @@ pub fn process_image<P: AsRef<Path>>(input: P, output: P, output_config: &Output
                 false => DynamicImage::ImageRgb8(img.to_rgb8()),
             };
             let webp = match webp::Encoder::from_image(&img) {
-                Ok(enc) => enc.encode(output_config.webp_quality),
+                Ok(enc) => enc.encode(output_config.quality),
                 Err(e) => return Err(anyhow!("Error encoding image: {}", e)),
             };
             std::fs::write(output, &*webp)?;
         }
-        // JPEG has no alpha channel
-        Some(ImageFormat::Jpeg) => DynamicImage::ImageRgb8(img.to_rgb8()).save_with_format(output, ImageFormat::Jpeg)?,
+        // JPEG has no alpha channel, and takes an integer quality from 1 to 100
+        Some(ImageFormat::Jpeg) => {
+            let quality = (output_config.quality.round() as u8).max(1);
+            let file = std::io::BufWriter::new(std::fs::File::create(output)?);
+            DynamicImage::ImageRgb8(img.to_rgb8())
+                .write_with_encoder(JpegEncoder::new_with_quality(file, quality))?;
+        }
         Some(format) => img.save_with_format(output, format)?,
         None => img.save(output)?,
     }
@@ -138,7 +148,7 @@ fn crop_image(img: &mut DynamicImage, aspect_ratio: f64) -> DynamicImage {
 
     let fit_width = image_aspect_ratio < aspect_ratio;
 
-    // At least 1px, so an extreme ratio on a tiny image can't crop it away entirely
+    // At least 1px, so an extreme configured ratio can't crop the image away entirely
     let (new_w, new_h) = match fit_width {
         true => (w, ((w as f64 / aspect_ratio) as u32).max(1)),
         false => (((h as f64 * aspect_ratio) as u32).max(1), h),
@@ -343,10 +353,10 @@ mod tests {
     fn reports_decoded_pixel_size() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("deep.png");
-        image::ImageBuffer::<Rgba<u16>, _>::new(4, 2).save(&path).unwrap();
+        image::ImageBuffer::<Rgba<u16>, _>::new(32, 16).save(&path).unwrap();
 
         let info = validate_image(&path).unwrap();
-        assert_eq!((info.width, info.height, info.bytes_per_pixel), (4, 2, 8));
+        assert_eq!((info.width, info.height, info.bytes_per_pixel), (32, 16, 8));
     }
 
     #[test]
@@ -355,13 +365,39 @@ mod tests {
         let in_path = dir.path().join("tiny.png");
         let out_path = dir.path().join("tiny.webp");
         let config = OutputConfig::new()
-            .aspect_ratio(2.)
+            .aspect_ratio(32.)
             .format(ImageFormat::WebP);
 
-        save_png(&RgbaImage::new(1, 1), &in_path);
+        save_png(&make_png(16, 16), &in_path);
 
         process_image(&in_path, &out_path, &config).unwrap();
         let decoded = image::open(&out_path).expect("decode webp");
-        assert_eq!(decoded.dimensions(), (1, 1));
+        assert_eq!(decoded.dimensions(), (16, 1));
+    }
+
+    #[test]
+    fn rejects_too_small_image() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("small.png");
+        save_png(&make_png(16, 15), &path);
+        assert!(validate_image(&path).is_err());
+
+        save_png(&make_png(16, 16), &path);
+        assert!(validate_image(&path).is_ok());
+    }
+
+    #[test]
+    fn applies_jpeg_quality() {
+        let dir = tempdir().unwrap();
+        let in_path = dir.path().join("in.png");
+        save_png(&make_png(256, 256), &in_path);
+
+        let size = |quality: f32| {
+            let out_path = dir.path().join(format!("out_{quality}.jpg"));
+            let config = OutputConfig::new().format(ImageFormat::Jpeg).quality(quality);
+            process_image(&in_path, &out_path, &config).unwrap();
+            fs::metadata(&out_path).unwrap().len()
+        };
+        assert!(size(10.) < size(95.), "quality had no effect");
     }
 }

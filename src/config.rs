@@ -9,6 +9,8 @@ const MIN_JWT_SECRET_LEN: usize = 32;
 pub struct Config {
     pub db_url: String,
     pub upload_dir: String,
+    /// Store images in this S3 bucket instead of `upload_dir`
+    pub s3_bucket: Option<String>,
     pub jwt_secret: String,
     pub config_file: Option<PathBuf>,
     pub bind_addr: String,
@@ -34,6 +36,7 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
 
     let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is not set!");
     let upload_dir = std::env::var("UPLOAD_DIR").unwrap_or_else(|_| "./uploads".to_string());
+    let s3_bucket = std::env::var("S3_BUCKET").ok().filter(|b| !b.is_empty());
     let jwt_secret = std::env::var("JWT_SECRET").expect("JWT_SECRET is not set!");
     // An empty or short secret would let anyone forge tokens
     assert!(
@@ -44,5 +47,5 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
 
     let bind_addr = bind_addr_arg();
 
-    Config { db_url, upload_dir, jwt_secret, config_file, bind_addr }
+    Config { db_url, upload_dir, s3_bucket, jwt_secret, config_file, bind_addr }
 });

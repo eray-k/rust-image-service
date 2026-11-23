@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select user_id, filepath, mime from image where id=$1",
+  "query": "select user_id, storage_key, mime from image where id=$1",
   "describe": {
     "columns": [
       {
@@ -10,7 +10,7 @@
       },
       {
         "ordinal": 1,
-        "name": "filepath",
+        "name": "storage_key",
         "type_info": "Text"
       },
       {
@@ -30,5 +30,5 @@
       true
     ]
   },
-  "hash": "966068a6c9661c2a588fe7bcca7b6beb676a313d46caf730cce5da3b75bbc2e8"
+  "hash": "fea84037e1696cf6c1affd209b2b95b8e8c7b2e7ca2d5db36dc039701013903b"
 }

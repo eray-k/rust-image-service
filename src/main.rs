@@ -2,8 +2,8 @@ use axum::routing::get;
 use axum::{extract::{DefaultBodyLimit, State}, http::StatusCode, routing::post, Router};
 use sqlx::PgPool;
 use std::sync::Arc;
-use tokio::fs;
 use anyhow::Result;
+use object_store::ObjectStore;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 use tracing::{error, info, Level};
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
@@ -17,10 +17,13 @@ mod config;
 mod engine;
 mod error;
 mod runtime;
+mod storage;
 
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
+    /// Processed images
+    storage: Arc<dyn ObjectStore>,
     /// Settings that can be reloaded while running
     runtime: Arc<Runtime>,
 }
@@ -48,11 +51,11 @@ async fn main() -> Result<()> {
 
     sqlx::migrate!("./migrations").run(&db).await.expect("Migrations failed");
     
-    // Prepare the upload directory
-    fs::create_dir_all(&CONFIG.upload_dir).await.expect("Couldn't create upload directory");
-    
+    let storage = storage::init().expect("Couldn't set up storage");
+
     let app_state = AppState {
         db: db.clone(),
+        storage,
         runtime,
     };
 

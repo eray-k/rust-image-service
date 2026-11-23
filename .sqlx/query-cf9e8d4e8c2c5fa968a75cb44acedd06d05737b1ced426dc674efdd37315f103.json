@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into image (id, user_id, filepath, mime) values ($1, $2, $3, $4)",
+  "query": "insert into image (id, user_id, storage_key, mime) values ($1, $2, $3, $4)",
   "describe": {
     "columns": [],
     "parameters": {
@@ -13,5 +13,5 @@
     },
     "nullable": []
   },
-  "hash": "4c70c9d5a712435fa02d6a4ec99d21ba3b17c1bc18c82c13b0d1dea5eaffab8f"
+  "hash": "cf9e8d4e8c2c5fa968a75cb44acedd06d05737b1ced426dc674efdd37315f103"
 }

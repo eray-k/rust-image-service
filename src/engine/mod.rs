@@ -1,16 +1,13 @@
-use std::path::PathBuf;
-
 use axum::{extract::{Path, State}, http::{header, HeaderValue, StatusCode}, response::{IntoResponse, Response}};
 use axum_typed_multipart::{FieldData, TryFromMultipart, TypedMultipart};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
-use tokio_util::io::ReaderStream;
+use object_store::{path::Path as StorePath, ObjectStoreExt, PutPayload};
 use tempfile::NamedTempFile;
-use tokio::fs::File;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::{auth::AuthUser, config::CONFIG, error::handle_internal_error, AppState};
+use crate::{auth::AuthUser, error::handle_internal_error, AppState};
 use crate::engine::image_engine::{process_image, validate_image, ImageInfo, InvalidImage};
 use crate::runtime::{Runtime, RuntimeConfig};
 
@@ -71,17 +68,19 @@ pub async fn upload(
 
     let new_uuid = uuid::Uuid::new_v4();
 
-    let mut filepath = PathBuf::from(&CONFIG.upload_dir);
-    filepath.push(new_uuid.to_string());
-    filepath.set_extension(format.extensions_str()[0]);
+    let key = format!("{}.{}", new_uuid, format.extensions_str()[0]);
+    let key_path = StorePath::from(key.as_str());
 
-    // Process and persist image before recording it, so a failure leaves no dangling row
-    let output_path = filepath.clone();
+    // Process into a temp file first; it's only sent to storage once it's known to be valid
+    let output = tempfile::Builder::new()
+        .suffix(&format!(".{}", format.extensions_str()[0]))
+        .tempfile()
+        .map_err(handle_internal_error)?;
     let permits = acquire_processing(&state.runtime, &config, &info).await?;
-    tokio::task::spawn_blocking(move || {
+    let output = tokio::task::spawn_blocking(move || {
         // Held by the task itself, so capacity stays reserved even if the client disconnects
         let _permits = permits;
-        process_image(image.contents.path(), &output_path, &output_config)
+        process_image(image.contents.path(), output.path(), &output_config).map(|_| output)
     }).await
         .map_err(handle_internal_error)?
         .map_err(|e| match e.downcast_ref::<InvalidImage>() {
@@ -93,17 +92,25 @@ pub async fn upload(
             None => handle_internal_error(e),
         })?;
 
+    // Output is capped by the 8192 px limit and the request size, so it fits in memory
+    let bytes = tokio::fs::read(output.path()).await.map_err(handle_internal_error)?;
+
+    // Store before recording, so a failure leaves no dangling row
+    state.storage.put(&key_path, PutPayload::from(bytes)).await.map_err(handle_internal_error)?;
+
     // Insert into db
     if let Err(e) = sqlx::query!(
-        "insert into image (id, user_id, filepath, mime) values ($1, $2, $3, $4)",
+        "insert into image (id, user_id, storage_key, mime) values ($1, $2, $3, $4)",
         new_uuid,
         user_id,
-        filepath.to_str(),
+        key,
         format.to_mime_type()
     )
     .execute(&state.db)
     .await {
-        let _ = tokio::fs::remove_file(&filepath).await;
+        if let Err(e) = state.storage.delete(&key_path).await {
+            error!("Failed to remove orphaned object {}: {}", key, e);
+        }
         return Err(handle_internal_error(e));
     }
 
@@ -115,34 +122,29 @@ pub async fn download(
     state: State<AppState>) -> Result<Response, (StatusCode, String)> {
     let not_found_err = Err((StatusCode::NOT_FOUND, "File not found".to_string()));
 
-    let db_model = match sqlx::query!("select user_id, filepath, mime from image where id=$1", image_id)
+    let db_model = match sqlx::query!("select user_id, storage_key, mime from image where id=$1", image_id)
         .fetch_optional(&state.db).await {
             Ok(Some(model)) => model,
             Ok(None) => return not_found_err,
             Err(e) => return Err(handle_internal_error(e))
         };
 
-    if db_model.filepath.is_none() || db_model.mime.is_none() {
+    if db_model.storage_key.is_none() || db_model.mime.is_none() {
         error!("Database model is missing fields: {:?}", db_model);
         return not_found_err;
     }
 
-    let path = PathBuf::from(db_model.filepath.unwrap());
-
-    // Ensure file exists
-    if !path.is_file() {
-        error!("File does not exist at path: {:?}", path);
-        return not_found_err;
-    }
-
-    // Open & stream
-    let file = match File::open(&path).await {
-            Ok(f) => f,
-            Err(e) => return Err(handle_internal_error(e))
+    let key = db_model.storage_key.unwrap();
+    let object = match state.storage.get(&StorePath::from(key.as_str())).await {
+        Ok(object) => object,
+        Err(object_store::Error::NotFound { .. }) => {
+            error!("Object does not exist: {}", key);
+            return not_found_err;
+        }
+        Err(e) => return Err(handle_internal_error(e)),
     };
 
-    let stream = ReaderStream::new(file);
-    let body = axum::body::Body::from_stream(stream);
+    let body = axum::body::Body::from_stream(object.into_stream());
 
     // Content-Disposition (RFC 5987 for UTF-8 filenames)
     let encoded = utf8_percent_encode(&image_id.to_string(), NON_ALPHANUMERIC).to_string();
@@ -162,8 +164,8 @@ pub async fn delete_image(
     AuthUser(user_id): AuthUser,
 ) -> Result<(), (StatusCode, String)> {
     // Someone else's image is reported as not found, so ids of other users' images aren't revealed
-    let filepath = sqlx::query_scalar!(
-        "delete from image where id=$1 and user_id=$2 returning filepath",
+    let storage_key = sqlx::query_scalar!(
+        "delete from image where id=$1 and user_id=$2 returning storage_key",
         image_id,
         user_id
     )
@@ -172,10 +174,11 @@ pub async fn delete_image(
     .map_err(handle_internal_error)?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Image not found".to_string()))?;
 
-    // Row is already gone; a failure here only leaks the file
-    if let Some(filepath) = filepath
-        && let Err(e) = tokio::fs::remove_file(&filepath).await {
-        error!("Failed to delete file {}: {}", filepath, e);
+    // Row is already gone; a failure here only leaks the object
+    if let Some(key) = storage_key
+        && let Err(e) = state.storage.delete(&StorePath::from(key.as_str())).await
+        && !matches!(e, object_store::Error::NotFound { .. }) {
+        error!("Failed to delete object {}: {}", key, e);
     }
 
     Ok(())

@@ -19,7 +19,7 @@ Small Rust service that accepts single-file image uploads and records them in a 
 - Processes the image file: by default center-crops to 1:1, downscales to 1024 px wide (never upscales) and converts to WebP.
 - Images must be between 16x16 and 8192x8192 pixels.
 - Only PNG, JPEG and WebP inputs are accepted; other decoders are not compiled in.
-- Persists the processed image to the `UPLOAD_DIR` and inserts a record in the `image` table (id, user_id, filepath).
+- Persists the processed image to `UPLOAD_DIR`, or to an S3-compatible bucket when `S3_BUCKET` is set (see `.env.template`), and inserts a record in the `image` table (id, user_id, storage_key). `storage_key` is the object key, `<id>.<ext>`. Switching backends doesn't move existing images.
 
 ## Repo layout
 
@@ -68,7 +68,7 @@ By default, the server binds to `127.0.0.1:7070`. Pass `--bind <addr>` to change
 
 ## Notes & TODOs
 
-- S3 file uploads will be implemented.
+- ~~S3 file uploads will be implemented.~~
 
 - Make the processing limit adaptive (AIMD): grow the concurrent job limit while processing latency stays low and halve it when latency spikes, instead of relying only on the configured memory budget and worker count.
 
